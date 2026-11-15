@@ -3,7 +3,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .editing import paragraphs
 from .storage import Interview, Segment
+
+
+def _layout(segments: list[Segment], layout: str) -> list[Segment]:
+    """'lines' = one line per segment; 'paragraphs' = joined by speaker / pauses."""
+    return paragraphs(segments) if layout == "paragraphs" else segments
 
 
 def fmt_time(ms: int, srt: bool = False) -> str:
@@ -41,12 +47,13 @@ def _line(seg: Segment, timestamps: bool) -> str:
 
 
 def export_txt(iv: Interview, segments: list[Segment], dst: Path, *, timestamps: bool = True,
-               duration_s: float = 0.0, organisation: str = "") -> None:
+               duration_s: float = 0.0, organisation: str = "", layout: str = "lines") -> None:
     lines = [iv.title, "=" * len(iv.title)]
     lines += [f"{k}: {v}" for k, v in _header_rows(iv, duration_s, organisation)]
     lines.append("")
-    lines += [_line(s, timestamps) for s in segments]
-    Path(dst).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sep = "\n\n" if layout == "paragraphs" else "\n"
+    body = sep.join(_line(s, timestamps) for s in _layout(segments, layout))
+    Path(dst).write_text("\n".join(lines) + "\n" + body + "\n", encoding="utf-8")
 
 
 def export_srt(segments: list[Segment], dst: Path) -> None:
@@ -58,7 +65,7 @@ def export_srt(segments: list[Segment], dst: Path) -> None:
 
 
 def export_docx(iv: Interview, segments: list[Segment], dst: Path, *, timestamps: bool = True,
-                duration_s: float = 0.0, organisation: str = "") -> None:
+                duration_s: float = 0.0, organisation: str = "", layout: str = "lines") -> None:
     from docx import Document
     from docx.shared import Pt, RGBColor
 
@@ -79,8 +86,10 @@ def export_docx(iv: Interview, segments: list[Segment], dst: Path, *, timestamps
             cells[0].paragraphs[0].runs[0].bold = True
     doc.add_heading("Transcript", level=2)
 
-    for s in segments:
+    for s in _layout(segments, layout):
         p = doc.add_paragraph()
+        if layout == "paragraphs":
+            p.paragraph_format.space_after = Pt(10)
         if timestamps:
             r = p.add_run(f"[{fmt_time(s.start_ms)}]  ")
             r.font.color.rgb = RGBColor(0x80, 0x80, 0x80)

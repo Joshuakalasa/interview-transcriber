@@ -51,4 +51,13 @@ if (-not (Test-Path $dest)) {
 } else {
     Write-Host "Model $file already present."
 }
+# 3. Silero VAD model (~1 MB) used for "Skip silence"
+$vad = Join-Path $models "ggml-silero-v5.1.2.bin"
+if (-not (Test-Path $vad)) {
+    Write-Host "Downloading VAD model ggml-silero-v5.1.2.bin ..."
+    Invoke-WebRequest "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" -OutFile "$vad.part"
+    Move-Item "$vad.part" $vad -Force
+} else {
+    Write-Host "VAD model already present."
+}
 Write-Host "Done."

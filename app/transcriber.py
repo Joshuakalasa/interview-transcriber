@@ -10,18 +10,90 @@ from PySide6.QtCore import QObject, QProcess, Signal
 from .storage import Segment
 
 PROGRESS_RE = re.compile(r"progress\s*=\s*(\d+)\s*%")
+SENTENCE_END = re.compile(r"[.!?][\"')\]]*$")
+ABBREVIATION = re.compile(r"\b(Mr|Mrs|Ms|Dr|Prof|St|Mt|vs|etc|e\.g|i\.e|No)\.$", re.IGNORECASE)
+MIN_SENTENCE_CHARS = 25   # avoid tiny lines like "Sure." on their own
 
 
-def parse_whisper_json(path: Path) -> list[Segment]:
-    raw = path.read_bytes().decode("utf-8", errors="replace")
-    data = json.loads(raw)
-    segments: list[Segment] = []
-    for item in data.get("transcription", []):
-        text = (item.get("text") or "").strip()
-        if not text:
+def clean_text(text: str) -> str:
+    """Tidy whisper output: trim and remove stray quote marks wrapping a passage."""
+    text = text.strip()
+    if text.count('"') == 2 and text.startswith('"') and text.endswith('"'):
+        text = text[1:-1].strip()
+    elif text.count('"') == 1 and (text.startswith('"') or text.endswith('"')):
+        text = text.strip('"').strip()
+    return text
+
+
+MAX_LINE_CHARS = 300      # if nobody uses punctuation, still break at a whisper segment end
+
+
+def _timed_tokens(items: list[dict], vad: bool) -> list[tuple[str, int, int, bool]]:
+    """Flatten all tokens to (text, from_ms, to_ms, ends_whisper_segment).
+
+    With VAD, whisper.cpp maps *segment* times back to the original audio but leaves
+    *token* times on the silence-removed timeline, so token times are stretched
+    linearly into their segment's corrected time span.
+    """
+    out = []
+    for item in items:
+        toks = [t for t in item.get("tokens", []) if not t.get("text", "").startswith("[_")]
+        if not toks:
             continue
-        off = item.get("offsets", {})
-        segments.append(Segment(int(off.get("from", 0)), int(off.get("to", 0)), text))
+        t_from = [int(t.get("offsets", {}).get("from", 0)) for t in toks]
+        t_to = [int(t.get("offsets", {}).get("to", 0)) for t in toks]
+        if vad:
+            s0 = int(item.get("offsets", {}).get("from", 0))
+            s1 = int(item.get("offsets", {}).get("to", 0))
+            a, b = t_from[0], max(t_to)
+            scale = (s1 - s0) / (b - a) if b > a else 0.0
+            t_from = [int(s0 + (x - a) * scale) for x in t_from]
+            t_to = [int(s0 + (x - a) * scale) for x in t_to]
+        for i, t in enumerate(toks):
+            out.append((t.get("text", ""), t_from[i], t_to[i], i == len(toks) - 1))
+    return out
+
+
+def _split_by_sentences(tokens: list[tuple[str, int, int, bool]]) -> list[Segment]:
+    """Cut the token stream at sentence ends (works across whisper segment boundaries)."""
+    out: list[Segment] = []
+    text, start, end = "", None, 0
+
+    def emit():
+        cleaned = clean_text(text)
+        if cleaned:
+            out.append(Segment(start or 0, max(end, start or 0), cleaned))
+
+    for i, (t, t0, t1, seg_end) in enumerate(tokens):
+        if start is None and any(c.isalnum() for c in t):
+            start = t0
+        text += t
+        end = max(end, t1)
+        nxt = tokens[i + 1][0] if i + 1 < len(tokens) else " "
+        stripped = text.strip()
+        sentence_done = (SENTENCE_END.search(t.strip()) and nxt.startswith(" ")   # not "3.5"
+                         and len(stripped) >= MIN_SENTENCE_CHARS
+                         and not ABBREVIATION.search(stripped))
+        too_long = seg_end and len(stripped) >= MAX_LINE_CHARS
+        if sentence_done or too_long:
+            emit()
+            text, start, end = "", None, 0
+    if text.strip():
+        emit()
+    return out
+
+
+def parse_whisper_json(path: Path, split_sentences: bool = True, vad: bool = False) -> list[Segment]:
+    raw = path.read_bytes().decode("utf-8", errors="replace")
+    items = json.loads(raw).get("transcription", [])
+    if split_sentences and any(i.get("tokens") for i in items):
+        return _split_by_sentences(_timed_tokens(items, vad))
+    segments: list[Segment] = []
+    for item in items:
+        text = clean_text(item.get("text") or "")
+        if text:
+            off = item.get("offsets", {})
+            segments.append(Segment(int(off.get("from", 0)), int(off.get("to", 0)), text))
     return segments
 
 
@@ -43,7 +115,10 @@ class TranscribeJob(QObject):
         return self.proc is not None and self.proc.state() != QProcess.NotRunning
 
     def start(self, cli: Path, model: Path, wav: Path, out_base: Path, *,
-              language: str = "en", threads: int = 4, prompt: str = "") -> None:
+              language: str = "en", threads: int = 4, prompt: str = "",
+              vad_model: Path | None = None, split_sentences: bool = True) -> None:
+        self.split_sentences = split_sentences
+        self.vad_used = bool(vad_model and Path(vad_model).exists())
         cli, model = Path(cli), Path(model)
         if not cli.exists():
             self.failed.emit(f"whisper-cli not found:\n{cli}\n\nRun setup or fix the path in Settings.")
@@ -58,7 +133,10 @@ class TranscribeJob(QObject):
             json_path.unlink()
 
         args = ["-m", str(model), "-f", str(wav), "-l", language, "-t", str(threads),
-                "-oj", "-of", str(self.out_base), "-pp"]
+                "-ojf", "-of", str(self.out_base), "-pp"]   # -ojf: includes word timings
+        if vad_model and Path(vad_model).exists():
+            # Skip silence: faster on long interviews and fewer made-up phrases in pauses.
+            args += ["--vad", "-vm", str(vad_model)]
         if prompt.strip():
             args += ["--prompt", prompt.strip()]
 
@@ -102,7 +180,7 @@ class TranscribeJob(QObject):
             self.failed.emit(f"whisper-cli exited with code {code}.\n\n{detail}")
             return
         try:
-            segments = parse_whisper_json(json_path)
+            segments = parse_whisper_json(json_path, self.split_sentences, self.vad_used)
         except Exception as e:
             self.failed.emit(f"Could not read whisper output: {e}")
             return

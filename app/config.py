@@ -34,6 +34,10 @@ DEFAULTS: dict = {
     "vocabulary": "",              # names / terms to help spelling
     "organisation": "",            # printed on exports
     "default_interviewer": "",
+    "use_vad": True,               # skip silence (needs the Silero VAD model)
+    "vad_model": "ggml-silero-v5.1.2.bin",
+    "split_sentences": True,       # one line per sentence instead of ~30 s blocks
+    "playback_rate": 1.0,
 }
 
 
@@ -55,6 +59,13 @@ class Settings:
 
     def save(self) -> None:
         self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+
+    def vad_model_path(self) -> Path | None:
+        """Path to the VAD model if silence skipping is on and the model exists."""
+        if not self["use_vad"]:
+            return None
+        p = Path(self["models_dir"]) / self["vad_model"]
+        return p if p.exists() else None
 
     def available_models(self) -> list[str]:
         folder = Path(self["models_dir"])

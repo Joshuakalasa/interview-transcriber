@@ -61,12 +61,15 @@ The interviews root folder is configurable, so a team can point it at a shared d
 - [x] Settings dialog (folders, whisper-cli path, threads, vocabulary, organisation name)
 - [x] Setup script that downloads whisper.cpp + a model
 
-### Phase 2 — Editor & quality
-- Speaker column workflow: assign/rename speakers, bulk “rename Speaker 1 → Interviewer”
-- Split / merge segments, find & replace, keyboard shortcuts for playback (play/pause, back 5 s)
-- Silero VAD option (skip silence → faster, fewer hallucinations)
-- Paragraph-mode export (merge short segments into readable paragraphs)
-- Crash-safe recording (write in chunks, recover after power loss)
+### Phase 2 — Editor & quality (done)
+- [x] Speaker workflow: buttons + Ctrl+1…9 (auto-advance to next line), drop-down per line, add, rename everywhere
+- [x] Split / merge / delete lines, undo (100 steps), find & replace
+- [x] Playback: Ctrl+Space, ±5 s, play selected line, speed 0.5×–1.5×, highlight of the line being played
+- [x] One line per sentence (uses whisper word timings; joins sentences cut across whisper blocks)
+- [x] Silero VAD “skip silence” (word timings re-mapped to the original audio)
+- [x] Paragraph-layout export (by speaker, or by pauses when no speakers)
+- [x] Crash-safe recording (raw PCM flushed every 3 s, recovery prompt)
+- [x] Unit tests (`python -m unittest`)
 
 ### Phase 3 — Team readiness
 - Automatic speaker diarization offline (sherpa-onnx speaker models)

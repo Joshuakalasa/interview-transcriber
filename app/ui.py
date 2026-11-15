@@ -6,23 +6,42 @@ import shutil
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter,
     QVBoxLayout, QWidget,
 )
 
 from . import audio_utils, exporter
 from .config import Settings
-from .recorder import Recorder, list_input_devices
-from .storage import Interview, Segment, create_interview, list_interviews
+from .recorder import (Recorder, discard_recording, finalize_recording, list_input_devices,
+                       pending_recording)
+from .storage import Interview, create_interview, list_interviews
 from .transcriber import TranscribeJob
+from .transcript_editor import TranscriptEditor
 
 AUDIO_FILTER = "Audio (*.wav *.mp3 *.m4a *.flac *.ogg *.aac *.wma *.mp4);;All files (*.*)"
+SKIP_MS = 5000
+PLAY_LEAD_MS = 300   # start a little before the line so the first word isn't clipped
+
+SHORTCUTS_HELP = """\
+<b>Playback</b><br>
+Ctrl+Space — play / pause<br>
+Alt+Left / Alt+Right — back / forward 5 seconds<br>
+Ctrl+J — play the selected line<br>
+Double-click a time — play from there<br><br>
+<b>Editing</b><br>
+Double-click text or F2 — edit a line (Enter saves, Esc cancels)<br>
+Ctrl+1 … Ctrl+9 — set speaker of selected lines (Ctrl+0 clears)<br>
+Ctrl+M — merge selected lines<br>
+Ctrl+K — split line (at the cursor while editing)<br>
+Ctrl+Delete — delete selected lines<br>
+Ctrl+Z — undo<br>
+Ctrl+F — find &amp; replace, F3 — find next
+"""
 
 
 class Worker(QThread):
@@ -58,6 +77,13 @@ class SettingsDialog(QDialog):
         self.threads.setRange(1, 64)
         self.threads.setValue(int(settings["threads"]))
         form.addRow("CPU threads", self.threads)
+
+        self.vad = QCheckBox("Skip silence (faster, fewer made-up words in pauses)")
+        self.vad.setChecked(bool(settings["use_vad"]))
+        form.addRow("Transcription", self.vad)
+        self.sentences = QCheckBox("One line per sentence")
+        self.sentences.setChecked(bool(settings["split_sentences"]))
+        form.addRow("", self.sentences)
 
         self.org = QLineEdit(settings["organisation"])
         form.addRow("Organisation (on exports)", self.org)
@@ -100,6 +126,8 @@ class SettingsDialog(QDialog):
         self.s["whisper_cli"] = self.cli.text().strip()
         self.s["ffmpeg"] = self.ffmpeg.text().strip()
         self.s["threads"] = self.threads.value()
+        self.s["use_vad"] = self.vad.isChecked()
+        self.s["split_sentences"] = self.sentences.isChecked()
         self.s["organisation"] = self.org.text().strip()
         self.s["default_interviewer"] = self.interviewer.text().strip()
         self.s["vocabulary"] = self.vocab.toPlainText().strip()
@@ -113,20 +141,19 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = Settings()
         self.current: Interview | None = None
-        self.segments: list[Segment] = []
         self.recorder = Recorder()
         self.job = TranscribeJob(self)
         self.workers: list[Worker] = []
-        self._loading_table = False
 
         self.setWindowTitle("Interview Transcriber")
-        self.resize(1200, 780)
+        self.resize(1250, 820)
         self._build_menu()
         self._build_ui()
 
         self.player = QMediaPlayer(self)
         self.audio_out = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_out)
+        self.player.setPlaybackRate(float(self.settings["playback_rate"]))
         self.player.positionChanged.connect(self._on_player_position)
         self.player.playbackStateChanged.connect(self._on_playback_state)
 
@@ -137,6 +164,7 @@ class MainWindow(QMainWindow):
         self.meter_timer = QTimer(self, interval=100, timeout=self._update_meter)
         self.autosave_timer = QTimer(self, singleShot=True, interval=800, timeout=self._save_segments)
 
+        self._shortcuts()
         self.refresh_list()
         self._set_interview(None)
         QTimer.singleShot(300, self._check_setup)
@@ -145,7 +173,8 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         m = self.menuBar().addMenu("&File")
         for text, slot in [("New interview", self.new_interview), ("Import audio…", self.import_audio),
-                           ("Settings…", self.open_settings), ("Open interviews folder", self.open_root)]:
+                           ("Settings…", self.open_settings), ("Open interviews folder", self.open_root),
+                           ("Open this interview's folder", self.open_current)]:
             a = QAction(text, self)
             a.triggered.connect(slot)
             m.addAction(a)
@@ -153,6 +182,10 @@ class MainWindow(QMainWindow):
         quit_ = QAction("Exit", self)
         quit_.triggered.connect(self.close)
         m.addAction(quit_)
+        h = self.menuBar().addMenu("&Help")
+        keys = QAction("Keyboard shortcuts", self)
+        keys.triggered.connect(lambda: QMessageBox.information(self, "Keyboard shortcuts", SHORTCUTS_HELP))
+        h.addAction(keys)
 
     def _build_ui(self):
         splitter = QSplitter()
@@ -216,7 +249,7 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.device_combo)
         rb = QHBoxLayout()
         self.btn_rec = QPushButton("● Record")
-        self.btn_rec.setStyleSheet("QPushButton{color:#c62828;font-weight:bold}")
+        self.btn_rec.setStyleSheet("QPushButton{color:#e53935;font-weight:bold}")
         self.btn_rec.clicked.connect(self.start_recording)
         self.btn_pause = QPushButton("Pause")
         self.btn_pause.setCheckable(True)
@@ -258,33 +291,43 @@ class MainWindow(QMainWindow):
         rv.addLayout(row)
         self._fill_models()
 
-        # transcript table
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Time", "Speaker", "Text"])
-        hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.Interactive)
-        hh.setSectionResizeMode(2, QHeaderView.Stretch)
-        self.table.setColumnWidth(1, 110)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setWordWrap(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed
-                                   | QAbstractItemView.AnyKeyPressed)
-        self.table.itemChanged.connect(self._on_cell_changed)
-        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
-        rv.addWidget(self.table, 1)
+        # transcript editor
+        self.editor = TranscriptEditor()
+        self.editor.changed.connect(self.autosave_timer_start)
+        self.editor.speakers_changed.connect(self._save_speakers)
+        self.editor.seek.connect(self.play_from)
+        self.editor.message.connect(lambda m: self.statusBar().showMessage(m, 5000))
+        rv.addWidget(self.editor, 1)
 
         # bottom bar: playback + export
         bottom = QHBoxLayout()
+        self.btn_back = QPushButton("⟲ 5s")
+        self.btn_back.setToolTip("Back 5 seconds (Alt+Left)")
+        self.btn_back.clicked.connect(lambda: self.skip(-SKIP_MS))
         self.btn_play = QPushButton("▶ Play")
+        self.btn_play.setToolTip("Play / pause (Ctrl+Space)")
         self.btn_play.clicked.connect(self.toggle_play)
+        self.btn_fwd = QPushButton("5s ⟳")
+        self.btn_fwd.setToolTip("Forward 5 seconds (Alt+Right)")
+        self.btn_fwd.clicked.connect(lambda: self.skip(SKIP_MS))
         self.play_pos = QLabel("00:00:00")
-        bottom.addWidget(self.btn_play)
-        bottom.addWidget(self.play_pos)
-        bottom.addWidget(QLabel("  Tip: double-click a time to jump there."))
+        self.play_pos.setStyleSheet("font-family: Consolas")
+        self.speed = QComboBox()
+        for r in (0.5, 0.75, 1.0, 1.25, 1.5):
+            self.speed.addItem(f"{r:g}×", r)
+        self.speed.setCurrentIndex(max(0, self.speed.findData(float(self.settings["playback_rate"]))))
+        self.speed.setToolTip("Playback speed")
+        self.speed.currentIndexChanged.connect(self._set_speed)
+        for w in (self.btn_back, self.btn_play, self.btn_fwd, self.play_pos, self.speed):
+            bottom.addWidget(w)
         bottom.addStretch(1)
-        self.chk_ts = QCheckBox("Include timestamps")
+        self.layout_combo = QComboBox()
+        self.layout_combo.addItem("Line by line", "lines")
+        self.layout_combo.addItem("Paragraphs", "paragraphs")
+        self.layout_combo.setToolTip("Paragraphs: joins lines by the same speaker (or without long pauses)")
+        bottom.addWidget(QLabel("Layout"))
+        bottom.addWidget(self.layout_combo)
+        self.chk_ts = QCheckBox("Timestamps")
         self.chk_ts.setChecked(True)
         bottom.addWidget(self.chk_ts)
         for label, fmt in (("Export Word", "docx"), ("Export TXT", "txt"), ("Export SRT", "srt")):
@@ -294,16 +337,23 @@ class MainWindow(QMainWindow):
         rv.addLayout(bottom)
 
         splitter.addWidget(right)
-        splitter.setSizes([260, 940])
-        self.statusBar().showMessage("Ready")
+        splitter.setSizes([260, 990])
+        self.statusBar().showMessage("Ready — Help → Keyboard shortcuts")
+
+    def _shortcuts(self):
+        for keys, slot in (("Ctrl+Space", self.toggle_play),
+                           ("Alt+Left", lambda: self.skip(-SKIP_MS)),
+                           ("Alt+Right", lambda: self.skip(SKIP_MS)),
+                           ("Ctrl+J", self.play_selected)):
+            s = QShortcut(QKeySequence(keys), self)
+            s.activated.connect(slot)
 
     def _fill_devices(self):
         self.device_combo.clear()
         self.device_combo.addItem("Default microphone", None)
         for idx, name in list_input_devices():
             self.device_combo.addItem(name, idx)
-        saved = self.settings["input_device"]
-        i = self.device_combo.findData(saved)
+        i = self.device_combo.findData(self.settings["input_device"])
         if i >= 0:
             self.device_combo.setCurrentIndex(i)
 
@@ -361,13 +411,13 @@ class MainWindow(QMainWindow):
         self.player.setSource(QUrl())
         self.current = iv
         enabled = iv is not None
-        for w in list(self.meta_edits.values()) + [self.btn_rec, self.btn_transcribe, self.table]:
+        for w in list(self.meta_edits.values()) + [self.editor]:
             w.setEnabled(enabled)
         for k, e in self.meta_edits.items():
             e.setText(iv.meta.get(k, "") if iv else "")
-        self.segments = iv.load_segments() if iv else []
-        self._load_table()
-        self.progress.setValue(100 if self.segments else 0)
+        segments = iv.load_segments() if iv else []
+        self.editor.set_content(segments, iv.meta.get("speakers") if iv else None)
+        self.progress.setValue(100 if segments else 0)
         if iv and iv.has_audio:
             self.player.setSource(QUrl.fromLocalFile(str(iv.audio_path)))
             dur = audio_utils.duration_seconds(iv.audio_path)
@@ -375,6 +425,28 @@ class MainWindow(QMainWindow):
         else:
             self.rec_time.setText("00:00:00")
         self._update_buttons()
+        if iv:
+            QTimer.singleShot(0, lambda: self._offer_recovery(iv))
+
+    def _offer_recovery(self, iv: Interview):
+        """A recording.pcm left behind means the app closed while recording."""
+        if self.recorder.is_recording or self.current is not iv or not pending_recording(iv.folder):
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Unfinished recording found")
+        box.setText("This interview has a recording that was not saved properly "
+                    "(the app or the computer may have closed while recording).\n\n"
+                    "Recover it?" + ("\n\nThis will replace the existing audio." if iv.has_audio else ""))
+        recover = box.addButton("Recover", QMessageBox.AcceptRole)
+        discard = box.addButton("Discard", QMessageBox.DestructiveRole)
+        box.addButton("Later", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is recover:
+            self._finalize_recording(iv)
+        elif box.clickedButton() is discard:
+            if QMessageBox.question(self, "Discard recording",
+                                    "Permanently delete the unfinished recording?") == QMessageBox.Yes:
+                discard_recording(iv.folder)
 
     def _update_buttons(self):
         rec = self.recorder.is_recording
@@ -399,6 +471,11 @@ class MainWindow(QMainWindow):
         item = self.list.currentItem()
         if item:
             item.setText(self._list_label(self.current))
+
+    def _save_speakers(self, speakers: list):
+        if self.current:
+            self.current.meta["speakers"] = list(speakers)
+            self.current.save_meta()
 
     def new_interview(self):
         title, ok = QInputDialog.getText(self, "New interview", "Title (e.g. 'Interview with Jane Doe'):")
@@ -461,13 +538,13 @@ class MainWindow(QMainWindow):
         self.settings["input_device"] = device
         self.settings.save()
         try:
-            self.recorder.start(iv.folder / "recording.wav", device)
+            self.recorder.start(iv.folder, device)
         except Exception as e:
             QMessageBox.critical(self, "Microphone error", f"Could not start recording:\n{e}")
             return
         self.btn_pause.setChecked(False)
         self.meter_timer.start()
-        self.statusBar().showMessage("Recording…")
+        self.statusBar().showMessage("Recording… (saved to disk continuously)")
         self._update_buttons()
 
     def _toggle_pause(self, paused: bool):
@@ -478,21 +555,15 @@ class MainWindow(QMainWindow):
     def stop_recording(self):
         if not self.recorder.is_recording:
             return
-        path = self.recorder.stop()
+        self.recorder.stop()
         self.meter_timer.stop()
         self.level.setValue(0)
-        iv = self.current
         if self.recorder.error:
             QMessageBox.warning(self, "Recording problem", self.recorder.error)
+        self._finalize_recording(self.current)
+        self._update_buttons()
 
-        def finalize():
-            if audio_utils.is_whisper_ready(path):
-                path.replace(iv.audio_path)
-            else:
-                audio_utils.to_whisper_wav(path, iv.audio_path)
-                path.unlink(missing_ok=True)
-            return iv
-
+    def _finalize_recording(self, iv: Interview):
         def done(_):
             iv.meta["status"] = "recorded"
             iv.meta["duration_s"] = round(audio_utils.duration_seconds(iv.audio_path), 1)
@@ -501,11 +572,13 @@ class MainWindow(QMainWindow):
             self.refresh_list(select=iv.folder)
 
         def fail(msg):
-            QMessageBox.warning(self, "Saving failed", msg)
+            QMessageBox.warning(self, "Saving failed",
+                                f"{msg}\n\nThe raw recording is kept in the interview folder.")
             self._update_buttons()
 
-        self._run(finalize, done, fail)
-        self._update_buttons()
+        self.player.setSource(QUrl())  # release audio.wav before replacing it
+        self.statusBar().showMessage("Saving recording…")
+        self._run(lambda: finalize_recording(iv.folder, iv.audio_path), done, fail)
 
     def _update_meter(self):
         self.level.setValue(int(self.recorder.level * 100))
@@ -516,7 +589,7 @@ class MainWindow(QMainWindow):
         iv = self.current
         if not iv or not iv.has_audio:
             return
-        if self.segments and QMessageBox.question(
+        if self.editor.segments and QMessageBox.question(
                 self, "Transcribe again?",
                 "This will replace the current transcript, including your edits. Continue?") != QMessageBox.Yes:
             return
@@ -529,7 +602,8 @@ class MainWindow(QMainWindow):
             Path(self.settings["whisper_cli"]), Path(self.settings["models_dir"]) / model,
             iv.audio_path, iv.whisper_out_base,
             language=self.settings["language"], threads=int(self.settings["threads"]),
-            prompt=self.settings["vocabulary"],
+            prompt=self.settings["vocabulary"], vad_model=self.settings.vad_model_path(),
+            split_sentences=bool(self.settings["split_sentences"]),
         )
         if self.job.running:
             self.statusBar().showMessage(f"Transcribing with {model}… (you can keep editing details)")
@@ -537,12 +611,11 @@ class MainWindow(QMainWindow):
 
     def _on_transcribed(self, segments: list):
         iv = self.current
-        self.segments = segments
         iv.save_segments(segments)
         iv.meta["status"] = "transcribed"
         iv.save_meta()
-        self._load_table()
-        self.statusBar().showMessage(f"Done: {len(segments)} segments", 8000)
+        self.editor.set_content(segments, iv.meta.get("speakers"))
+        self.statusBar().showMessage(f"Done: {len(segments)} lines", 8000)
         item = self.list.currentItem()
         if item:
             item.setText(self._list_label(iv))
@@ -555,65 +628,62 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Transcription failed", msg)
         QTimer.singleShot(0, self._update_buttons)
 
-    # ---------------- transcript table
-    def _load_table(self):
-        self._loading_table = True
-        self.table.setRowCount(len(self.segments))
-        for r, s in enumerate(self.segments):
-            t = QTableWidgetItem(exporter.fmt_time(s.start_ms))
-            t.setFlags(t.flags() & ~Qt.ItemIsEditable)
-            t.setForeground(QColor("#1565c0"))
-            t.setToolTip("Double-click to play from here")
-            self.table.setItem(r, 0, t)
-            self.table.setItem(r, 1, QTableWidgetItem(s.speaker))
-            self.table.setItem(r, 2, QTableWidgetItem(s.text))
-        self.table.resizeRowsToContents()
-        self._loading_table = False
-
-    def _on_cell_changed(self, item: QTableWidgetItem):
-        if self._loading_table or item.row() >= len(self.segments):
-            return
-        seg = self.segments[item.row()]
-        if item.column() == 1:
-            seg.speaker = item.text().strip()
-        elif item.column() == 2:
-            seg.text = item.text().strip()
+    # ---------------- transcript saving
+    def autosave_timer_start(self):
         self.autosave_timer.start()
 
     def _save_segments(self):
-        if self.current and self.segments and not self._loading_table:
-            self.current.save_segments(self.segments)
-
-    def _on_cell_double_clicked(self, row: int, col: int):
-        if col == 0 and row < len(self.segments):
-            self.player.setPosition(self.segments[row].start_ms)
-            self.player.play()
+        if self.current and (self.editor.segments or self.current.transcript_path.exists()):
+            self.current.save_segments(self.editor.segments)
 
     # ---------------- playback
+    def _has_media(self) -> bool:
+        return not self.player.source().isEmpty()
+
     def toggle_play(self):
+        if not self._has_media():
+            return
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
         else:
             self.player.play()
 
+    def play_from(self, ms: int):
+        if self._has_media():
+            self.player.setPosition(max(0, ms - PLAY_LEAD_MS))
+            self.player.play()
+
+    def play_selected(self):
+        ms = self.editor.current_start_ms()
+        if ms is not None:
+            self.play_from(ms)
+
+    def skip(self, delta_ms: int):
+        if self._has_media():
+            self.player.setPosition(max(0, self.player.position() + delta_ms))
+
+    def _set_speed(self):
+        rate = float(self.speed.currentData())
+        self.player.setPlaybackRate(rate)
+        self.settings["playback_rate"] = rate
+        self.settings.save()
+
     def _on_playback_state(self, state):
-        self.btn_play.setText("❚❚ Pause" if state == QMediaPlayer.PlayingState else "▶ Play")
+        playing = state == QMediaPlayer.PlayingState
+        self.btn_play.setText("❚❚ Pause" if playing else "▶ Play")
+        if state == QMediaPlayer.StoppedState:
+            self.editor.set_playing_ms(None)
 
     def _on_player_position(self, ms: int):
         self.play_pos.setText(exporter.fmt_time(ms))
-        if self.player.playbackState() != QMediaPlayer.PlayingState:
-            return
-        for r, s in enumerate(self.segments):  # highlight the line being spoken
-            if s.start_ms <= ms < s.end_ms:
-                if self.table.currentRow() != r:
-                    self.table.selectRow(r)
-                    self.table.scrollToItem(self.table.item(r, 0))
-                break
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.editor.set_playing_ms(ms)
 
     # ---------------- export
     def export(self, fmt: str):
         iv = self.current
-        if not iv or not self.segments:
+        segments = self.editor.segments
+        if not iv or not segments:
             QMessageBox.information(self, "Nothing to export", "Transcribe the interview first.")
             return
         self._save_segments()
@@ -623,14 +693,15 @@ class MainWindow(QMainWindow):
             return
         kw = dict(timestamps=self.chk_ts.isChecked(),
                   duration_s=audio_utils.duration_seconds(iv.audio_path),
-                  organisation=self.settings["organisation"])
+                  organisation=self.settings["organisation"],
+                  layout=self.layout_combo.currentData())
         try:
             if fmt == "docx":
-                exporter.export_docx(iv, self.segments, Path(dst), **kw)
+                exporter.export_docx(iv, segments, Path(dst), **kw)
             elif fmt == "txt":
-                exporter.export_txt(iv, self.segments, Path(dst), **kw)
+                exporter.export_txt(iv, segments, Path(dst), **kw)
             else:
-                exporter.export_srt(self.segments, Path(dst))
+                exporter.export_srt(segments, Path(dst))
         except PermissionError:
             QMessageBox.warning(self, "Export failed", "The file is open in another program. Close it and try again.")
             return
@@ -648,15 +719,24 @@ class MainWindow(QMainWindow):
         root.mkdir(parents=True, exist_ok=True)
         os.startfile(root)  # Windows
 
+    def open_current(self):
+        if self.current:
+            os.startfile(self.current.folder)
+
     def closeEvent(self, event):
         if self.recorder.is_recording:
             if QMessageBox.question(self, "Recording in progress",
                                     "Stop and save the recording before closing?") != QMessageBox.Yes:
                 event.ignore()
                 return
-            path = self.recorder.stop()
-            if self.current and audio_utils.is_whisper_ready(path):
-                path.replace(self.current.audio_path)
+            self.recorder.stop()
+            try:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                finalize_recording(self.current.folder, self.current.audio_path)
+            except Exception:
+                pass  # raw file stays; it will be offered for recovery next time
+            finally:
+                QApplication.restoreOverrideCursor()
         if self.job.running:
             if QMessageBox.question(self, "Transcription running",
                                     "Cancel the transcription and close?") != QMessageBox.Yes:

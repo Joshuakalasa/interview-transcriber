@@ -31,25 +31,31 @@ def _convert_with_ffmpeg(ffmpeg: Path, src: Path, dst: Path) -> None:
         raise ConversionError(res.stderr.strip() or "ffmpeg failed")
 
 
-def _convert_with_soundfile(src: Path, dst: Path) -> None:
-    try:
-        info = sf.info(str(src))
-    except Exception as e:
-        raise ConversionError(
-            f"Cannot read '{src.name}'. Supported without ffmpeg: WAV, MP3, FLAC, OGG. "
-            f"Install ffmpeg (tools/ffmpeg/ffmpeg.exe) for M4A/AAC/video files.\n{e}"
-        ) from e
+def _convert_with_soundfile(src: Path, dst: Path, raw_samplerate: int | None = None) -> None:
+    """Stream-convert src to dst. raw_samplerate: src is headerless 16-bit mono PCM."""
+    open_kw = {}
+    if raw_samplerate:
+        open_kw = dict(samplerate=raw_samplerate, channels=1, format="RAW", subtype="PCM_16")
+        src_rate = raw_samplerate
+    else:
+        try:
+            src_rate = sf.info(str(src)).samplerate
+        except Exception as e:
+            raise ConversionError(
+                f"Cannot read '{src.name}'. Supported without ffmpeg: WAV, MP3, FLAC, OGG. "
+                f"Install ffmpeg (tools/ffmpeg/ffmpeg.exe) for M4A/AAC/video files.\n{e}"
+            ) from e
 
     resampler = None
-    if info.samplerate != TARGET_SR:
+    if src_rate != TARGET_SR:
         import soxr
-        resampler = soxr.ResampleStream(info.samplerate, TARGET_SR, 1, dtype="float32",
+        resampler = soxr.ResampleStream(src_rate, TARGET_SR, 1, dtype="float32",
                                         quality="HQ")
 
     with sf.SoundFile(str(dst), "w", samplerate=TARGET_SR, channels=1,
                       subtype="PCM_16") as out:
         for block in sf.blocks(str(src), blocksize=BLOCK, dtype="float32",
-                               always_2d=True):
+                               always_2d=True, **open_kw):
             mono = block.mean(axis=1).astype(np.float32)
             if resampler is not None:
                 mono = resampler.resample_chunk(mono)
@@ -68,6 +74,14 @@ def to_whisper_wav(src: Path, dst: Path, ffmpeg: Path | None = None) -> None:
         _convert_with_ffmpeg(Path(ffmpeg), src, tmp)
     else:
         _convert_with_soundfile(src, tmp)
+    tmp.replace(dst)
+
+
+def raw_pcm_to_whisper_wav(pcm: Path, samplerate: int, dst: Path) -> None:
+    """Convert a crash-safe raw recording (16-bit mono PCM, no header) to audio.wav."""
+    dst = Path(dst)
+    tmp = dst.with_name(dst.stem + "_converting.wav")
+    _convert_with_soundfile(Path(pcm), tmp, raw_samplerate=samplerate)
     tmp.replace(dst)
 
 
