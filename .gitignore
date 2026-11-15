@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Downloaded by scripts/setup_whisper.ps1 (large binaries)
+tools/
+models/
+
+# Build output
+build/
+dist/
+*.spec
+
+# Never commit interview recordings or transcripts
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.docx
